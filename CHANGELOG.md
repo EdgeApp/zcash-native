@@ -1,6 +1,9 @@
-# React Native Zcash
+# zcash-native
 
 ## Unreleased
+
+- added: Node N-API addon (`zcash-native/node`) over zingolib `LightClient`, with one wallet file per alias under `documentDirectory`. Tools and Synchronizer keep the existing JS contract so Edge engines do not change. First open after this upgrade creates a new `.dat` and syncs from birthday.
+- changed: Replaced the vendored Zcash Swift/Android SDKs with UniFFI bindings to the same zingolib crate used by Node.
 
 ## 0.13.3 (2026-08-27)
 
