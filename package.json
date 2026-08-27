@@ -49,7 +49,12 @@
     "/package.json",
     "/prebuilds/",
     "/README.md",
-    "/rust/",
+    "/rust/build.rs",
+    "/rust/Cargo.lock",
+    "/rust/Cargo.toml",
+    "/rust/rust-toolchain.toml",
+    "/rust/src/",
+    "/rust/uniffi-bindgen.rs",
     "/src/",
     "/zcash-native.podspec"
   ],
