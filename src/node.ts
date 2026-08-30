@@ -1,10 +1,7 @@
 import { add } from 'biggystring'
-import {
-  EventSubscription,
-  NativeEventEmitter,
-  NativeModules
-} from 'react-native'
+import { mkdirSync } from 'fs'
 
+import { loadNativeAddon, NativeZcashAddon } from './load-addon'
 import {
   Addresses,
   CreateTransferOpts,
@@ -18,9 +15,12 @@ import {
   SpendSuccess,
   SynchronizerCallbacks
 } from './types'
+
 export * from './types'
 
-const { RNZcash } = NativeModules
+export interface MakeNodeZcashOpts {
+  documentDirectory: string
+}
 
 function parseJsonObject(value: string): unknown {
   try {
@@ -31,56 +31,53 @@ function parseJsonObject(value: string): unknown {
 }
 
 export const Tools = {
-  deriveViewingKey: async (
+  deriveViewingKey: (
     seedBytesHex: string,
     network: Network
   ): Promise<string> => {
-    const result = await RNZcash.deriveViewingKey(seedBytesHex, network)
-    return result
+    const addon = loadNativeAddon()
+    return Promise.resolve(addon.deriveViewingKey(seedBytesHex, network))
   },
   getBirthdayHeight: async (host: string, port: number): Promise<number> => {
-    const result = await RNZcash.getBirthdayHeight(host, port)
-    return result
+    const addon = loadNativeAddon()
+    return addon.getBirthdayHeight(host, port)
   },
-  isValidAddress: async (
+  isValidAddress: (
     address: string,
     network: Network = 'mainnet'
   ): Promise<boolean> => {
-    const result = await RNZcash.isValidAddress(address, network)
-    return result
+    const addon = loadNativeAddon()
+    return Promise.resolve(addon.isValidAddress(address, network))
   },
-  getIronwoodActivationHeight: async (
+  getIronwoodActivationHeight: (
     network: Network = 'mainnet'
   ): Promise<number | null> => {
-    const result = await RNZcash.ironwoodActivationHeight(network)
-    return result
+    const addon = loadNativeAddon()
+    return Promise.resolve(addon.ironwoodActivationHeight(network))
   }
 }
 
 export class Synchronizer {
-  eventEmitter: NativeEventEmitter
-  subscriptions: EventSubscription[]
   alias: string
   network: Network
+  private readonly addon: NativeZcashAddon
   private timer?: ReturnType<typeof setTimeout>
   private callbacks?: SynchronizerCallbacks
   private lastStatus?: string
 
-  constructor(alias: string, network: Network) {
-    this.eventEmitter = new NativeEventEmitter(RNZcash)
-    this.subscriptions = []
+  constructor(alias: string, network: Network, addon: NativeZcashAddon) {
     this.alias = alias
     this.network = network
+    this.addon = addon
   }
 
   async stop(): Promise<string> {
     this.unsubscribe()
-    const result = await RNZcash.stop(this.alias)
-    return result
+    return this.addon.stop(this.alias)
   }
 
   async initialize(initializerConfig: InitializerConfig): Promise<void> {
-    await RNZcash.initialize(
+    await this.addon.initialize(
       initializerConfig.mnemonicSeed,
       initializerConfig.birthdayHeight,
       initializerConfig.alias,
@@ -92,56 +89,54 @@ export class Synchronizer {
   }
 
   async deriveUnifiedAddress(): Promise<Addresses> {
-    const result = await RNZcash.deriveUnifiedAddress(this.alias)
-    return result
+    return this.addon.deriveUnifiedAddress(this.alias)
   }
 
   async getLatestNetworkHeight(alias: string): Promise<number> {
-    const result = await RNZcash.getLatestNetworkHeight(alias)
-    return result
+    return this.addon.getLatestNetworkHeight(alias)
   }
 
   async rescan(): Promise<void> {
-    await RNZcash.rescan(this.alias)
+    await this.addon.rescan(this.alias)
   }
 
   async proposeOrchardToIronwoodMigration(): Promise<
     ImmediateMigrationProposal
   > {
-    const result = await RNZcash.proposeOrchardToIronwoodMigration(this.alias)
-    return parseJsonObject(result) as ImmediateMigrationProposal
+    const raw = await this.addon.proposeOrchardToIronwoodMigration(this.alias)
+    return parseJsonObject(raw) as ImmediateMigrationProposal
   }
 
   async proposeTransfer(opts: ProposeTransferOpts): Promise<ProposalSuccess> {
-    const result = await RNZcash.proposeTransfer(
+    const raw = await this.addon.proposeTransfer(
       this.alias,
       opts.zatoshi,
       opts.toAddress,
       opts.memo
     )
-    return parseJsonObject(result) as ProposalSuccess
+    return parseJsonObject(raw) as ProposalSuccess
   }
 
   async proposeFulfillingPaymentURI(
     paymentUri: string
   ): Promise<ProposalSuccess> {
-    const result = await RNZcash.proposeFulfillingPaymentURI(
+    const raw = await this.addon.proposeFulfillingPaymentUri(
       this.alias,
       paymentUri
     )
-    return parseJsonObject(result) as ProposalSuccess
+    return parseJsonObject(raw) as ProposalSuccess
   }
 
   async createTransfer(
     opts: CreateTransferOpts
   ): Promise<SpendSuccess | SpendFailure> {
     try {
-      const result = await RNZcash.createTransfer(
+      const raw = await this.addon.createTransfer(
         this.alias,
         opts.proposalBase64,
         opts.mnemonicSeed
       )
-      return parseJsonObject(result) as SpendSuccess
+      return parseJsonObject(raw) as SpendSuccess
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : String(error)
@@ -150,36 +145,22 @@ export class Synchronizer {
   }
 
   async broadcastTransfer(txid: string): Promise<string> {
-    const result = await RNZcash.broadcastTransfer(this.alias, txid)
-    return result
+    return this.addon.broadcastTransfer(this.alias, txid)
   }
 
   async shieldFunds(shieldFundsInfo: ShieldFundsInfo): Promise<string> {
-    const result = await RNZcash.shieldFunds(
+    return this.addon.shieldFunds(
       this.alias,
       shieldFundsInfo.seed,
       shieldFundsInfo.memo,
       shieldFundsInfo.threshold
     )
-    return result
   }
 
-  subscribe({
-    onBalanceChanged,
-    onStatusChanged,
-    onTransactionsChanged,
-    onUpdate,
-    onError
-  }: SynchronizerCallbacks): void {
-    this.callbacks = {
-      onBalanceChanged,
-      onStatusChanged,
-      onTransactionsChanged,
-      onUpdate,
-      onError
-    }
+  subscribe(callbacks: SynchronizerCallbacks): void {
+    this.callbacks = callbacks
     this.pump().catch(error => {
-      onError({
+      callbacks.onError({
         alias: this.alias,
         level: 'error',
         message: `event pump failed: ${String(error)}`
@@ -193,15 +174,11 @@ export class Synchronizer {
       this.timer = undefined
     }
     this.callbacks = undefined
-    this.subscriptions.forEach(subscription => {
-      subscription.remove()
-    })
-    this.subscriptions = []
   }
 
   private async pump(): Promise<void> {
     if (this.callbacks == null) return
-    const snap = await RNZcash.poll(this.alias)
+    const snap = await this.addon.poll(this.alias)
     const {
       onBalanceChanged,
       onStatusChanged,
@@ -265,10 +242,24 @@ export class Synchronizer {
 export const makeSynchronizer = async (
   initializerConfig: InitializerConfig
 ): Promise<Synchronizer> => {
+  const addon = loadNativeAddon()
   const synchronizer = new Synchronizer(
     initializerConfig.alias,
-    initializerConfig.networkName
+    initializerConfig.networkName,
+    addon
   )
   await synchronizer.initialize(initializerConfig)
   return synchronizer
+}
+
+export function makeNodeZcashModule(
+  opts: MakeNodeZcashOpts
+): {
+  Tools: typeof Tools
+  makeSynchronizer: typeof makeSynchronizer
+} {
+  mkdirSync(opts.documentDirectory, { recursive: true })
+  const addon = loadNativeAddon()
+  addon.setDocumentDirectory(opts.documentDirectory)
+  return { Tools, makeSynchronizer }
 }
