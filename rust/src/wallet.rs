@@ -496,6 +496,16 @@ fn optional_memo(memo: Option<String>) -> WalletResult<Option<MemoBytes>> {
     }
 }
 
+fn describe_error(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut source = err.source();
+    while let Some(inner) = source {
+        parts.push(inner.to_string());
+        source = inner.source();
+    }
+    parts.join(": ")
+}
+
 fn map_propose_send_error(err: ProposeSendError) -> String {
     match err {
         ProposeSendError::Proposal(ZcbError::InsufficientFunds {
@@ -575,7 +585,7 @@ pub async fn create_transfer(
             .client
             .quick_immediate_migration(AccountId::ZERO, true)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| describe_error(&e))?;
         let txid = summary
             .txids
             .first()
@@ -592,7 +602,7 @@ pub async fn create_transfer(
         .client
         .calculate_stored_proposal()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| describe_error(&e))?;
     let txid = *txids.first();
     let raw = {
         let wallet = slot.client.wallet().read().await;
@@ -629,7 +639,7 @@ pub async fn broadcast_transfer(alias: String, txid: String) -> WalletResult<Str
         .client
         .transmit_calculated(txids)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| describe_error(&e))?;
     Ok(sent.first().to_string())
 }
 
@@ -666,12 +676,12 @@ pub async fn shield_funds(
     slot.client
         .propose_shield(AccountId::ZERO)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| describe_error(&e))?;
     let txids = slot
         .client
         .send_stored_proposal(true)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| describe_error(&e))?;
     Ok(txids.first().to_string())
 }
 

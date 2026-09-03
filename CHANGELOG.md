@@ -5,6 +5,7 @@
 - added: Node N-API addon (`zcash-native/node`) over zingolib `LightClient`, with one wallet file per alias under `documentDirectory`. Tools and Synchronizer keep the existing JS contract so Edge engines do not change. First open after this upgrade creates a new `.dat` and syncs from birthday.
 - changed: Replaced the vendored Zcash Swift/Android SDKs with UniFFI bindings to the same zingolib crate used by Node.
 - changed: The Sapling proving parameters (~50MB) are no longer compiled into the native library. They download from download.z.cash into `<documentDirectory>/sapling-params` the first time a wallet sees a Sapling balance, and again on demand if a Sapling spend finds them missing. Hashes are verified before the files are written.
+- fixed: Send, shield and migration failures now report the whole error chain instead of zingolib's outermost label. A rejected broadcast used to surface only "Send error.", which named neither the server nor the reason; it now carries the indexer's own message, so a consensus rejection reads as the rejection it is.
 
 ## 0.13.4 (2026-08-28)
 
