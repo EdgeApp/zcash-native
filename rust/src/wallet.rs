@@ -144,8 +144,45 @@ fn json_bool_field(value: &json::JsonValue, field: &str) -> bool {
 
 pub fn set_document_directory(path: String) -> WalletResult<()> {
     std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
-    *DOCUMENT_DIR.lock().expect("document dir lock") = Some(PathBuf::from(path));
+    let path = PathBuf::from(path);
+    // The Sapling proving parameters are cached beside the wallet data. The
+    // zingolib default sits under $HOME, which is not the writable, backed-up
+    // location on a phone -- the host picks that and hands it to us here.
+    zingolib::wallet::utils::set_sapling_params_directory(path.join("sapling-params"));
+    *DOCUMENT_DIR.lock().expect("document dir lock") = Some(path);
     Ok(())
+}
+
+/// Set once the Sapling parameter download has been started, so a sync that
+/// keeps reporting a Sapling balance does not queue it again.
+static SAPLING_PARAMS_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Starts the Sapling parameter download the first time a Sapling balance is
+/// seen.
+///
+/// The parameters are ~50MB and are needed only to spend Sapling notes, so
+/// they are fetched on the first receive rather than compiled in. Doing it
+/// here means the download runs while the user is still looking at an
+/// incoming transaction, long before they can ask to send it. The fetch is
+/// blocking and verifies against published hashes, so it goes to a blocking
+/// thread and its outcome is logged rather than surfaced: a failure here must
+/// not fail the poll, and the spend path retries.
+fn request_sapling_params_once(has_sapling: bool) {
+    use std::sync::atomic::Ordering;
+    if !has_sapling || SAPLING_PARAMS_REQUESTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tokio::task::spawn_blocking(|| {
+        match zingolib::wallet::utils::fetch_sapling_params() {
+            Ok(()) => eprintln!("[zcash] sapling params ready"),
+            Err(e) => {
+                // Allow a later poll to try again.
+                SAPLING_PARAMS_REQUESTED.store(false, Ordering::SeqCst);
+                eprintln!("[zcash] sapling params fetch failed: {e}");
+            }
+        }
+    });
 }
 
 pub async fn initialize(
@@ -391,6 +428,12 @@ pub async fn poll(alias: String) -> WalletResult<Poll> {
         ironwood_available_zatoshi: zat_str(balance.confirmed_ironwood_balance),
         ironwood_total_zatoshi: zat_str(balance.total_ironwood_balance),
     };
+
+    request_sapling_params_once(
+        balance
+            .total_sapling_balance
+            .is_some_and(|value| !value.is_zero()),
+    );
 
     let mut transactions = Vec::new();
     if let Ok(summaries) = slot.client.transaction_summaries(false).await {
