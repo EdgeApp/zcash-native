@@ -2,6 +2,8 @@ import { copyFile, mkdir, writeFile } from 'fs/promises'
 import { spawn } from 'child_process'
 import { join } from 'path'
 
+import { checkCodeSections } from './check-code-sections'
+
 const rustDir = join(__dirname, '../rust')
 const iosDir = join(__dirname, '../ios')
 const generated = join(rustDir, 'Generated')
@@ -118,6 +120,9 @@ async function main(): Promise<void> {
     ],
     iosDir
   )
+
+  console.log('Checking section flags...')
+  await checkCodeSections(xc)
 
   // xcodebuild rejects two libraries with the same headers path; write a
   // one-line note so the tree always has the Swift bindings even if the
