@@ -159,13 +159,7 @@ export class Synchronizer {
 
   subscribe(callbacks: SynchronizerCallbacks): void {
     this.callbacks = callbacks
-    this.pump().catch(error => {
-      callbacks.onError({
-        alias: this.alias,
-        level: 'error',
-        message: `event pump failed: ${String(error)}`
-      })
-    })
+    this.pumpAndReschedule()
   }
 
   unsubscribe(): void {
@@ -176,9 +170,40 @@ export class Synchronizer {
     this.callbacks = undefined
   }
 
-  private async pump(): Promise<void> {
+  /**
+   * Polls once, then schedules the next poll, sooner while syncing. A failed
+   * poll is reported and retried on the slower cadence.
+   */
+  private pumpAndReschedule(): void {
+    this.pump().then(
+      status => {
+        this.scheduleNextPump(status === 'SYNCING')
+      },
+      (error: unknown) => {
+        this.callbacks?.onError({
+          alias: this.alias,
+          level: 'error',
+          message: `event pump failed: ${String(error)}`
+        })
+        this.scheduleNextPump(false)
+      }
+    )
+  }
+
+  private scheduleNextPump(syncing: boolean): void {
+    if (this.callbacks == null) return
+    this.timer = setTimeout(
+      () => {
+        this.pumpAndReschedule()
+      },
+      syncing ? 500 : 2000
+    )
+  }
+
+  private async pump(): Promise<string | undefined> {
     if (this.callbacks == null) return
     const snap = await this.addon.poll(this.alias)
+    if (this.callbacks == null) return
     const {
       onBalanceChanged,
       onStatusChanged,
@@ -225,17 +250,7 @@ export class Synchronizer {
       scanProgress: snap.scanProgress,
       networkBlockHeight: snap.networkBlockHeight
     })
-
-    const delay = snap.status === 'SYNCING' ? 500 : 2000
-    this.timer = setTimeout(() => {
-      this.pump().catch(error => {
-        this.callbacks?.onError({
-          alias: this.alias,
-          level: 'error',
-          message: `event pump failed: ${String(error)}`
-        })
-      })
-    }, delay)
+    return snap.status
   }
 }
 

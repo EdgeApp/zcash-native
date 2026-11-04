@@ -747,6 +747,8 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -793,6 +795,8 @@ fun uniffi_zcash_checksum_func_propose_transfer(
 fun uniffi_zcash_checksum_func_rescan(
 ): Short
 fun uniffi_zcash_checksum_func_set_document_directory(
+): Short
+fun uniffi_zcash_checksum_func_set_legacy_directory(
 ): Short
 fun uniffi_zcash_checksum_func_shield_funds(
 ): Short
@@ -874,6 +878,8 @@ fun uniffi_zcash_fn_func_propose_transfer(`alias`: RustBuffer.ByValue,`zatoshi`:
 fun uniffi_zcash_fn_func_rescan(`alias`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_zcash_fn_func_set_document_directory(`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_zcash_fn_func_set_legacy_directory(`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_zcash_fn_func_shield_funds(`alias`: RustBuffer.ByValue,`seed`: RustBuffer.ByValue,`memo`: RustBuffer.ByValue,`threshold`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -1051,6 +1057,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_zcash_checksum_func_set_document_directory() != 27339.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_zcash_checksum_func_set_legacy_directory() != 61026.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_zcash_checksum_func_shield_funds() != 4791.toShort()) {
@@ -1814,6 +1823,15 @@ public object FfiConverterSequenceTypeTransaction: FfiConverterRustBuffer<List<T
         = 
     uniffiRustCallWithError(ZcashException) { _status ->
     UniffiLib.INSTANCE.uniffi_zcash_fn_func_set_document_directory(
+        FfiConverterString.lower(`path`),_status)
+}
+    
+    
+
+    @Throws(ZcashException::class) fun `setLegacyDirectory`(`path`: kotlin.String)
+        = 
+    uniffiRustCallWithError(ZcashException) { _status ->
+    UniffiLib.INSTANCE.uniffi_zcash_fn_func_set_legacy_directory(
         FfiConverterString.lower(`path`),_status)
 }
     

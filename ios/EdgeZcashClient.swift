@@ -7,6 +7,10 @@ enum EdgeZcashClient {
     try setDocumentDirectory(path: path)
   }
 
+  static func rustSetLegacyDirectory(path: String) throws {
+    try setLegacyDirectory(path: path)
+  }
+
   static func rustInitialize(
     mnemonicSeed: String,
     birthdayHeight: UInt32,

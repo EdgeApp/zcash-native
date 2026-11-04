@@ -23,6 +23,10 @@ pub fn set_document_directory(path: String) -> Result<(), ZcashError> {
     map(wallet::set_document_directory(path))
 }
 
+pub fn set_legacy_directory(path: String) -> Result<(), ZcashError> {
+    map(wallet::set_legacy_directory(path))
+}
+
 pub fn initialize(
     mnemonic_seed: String,
     birthday_height: u32,

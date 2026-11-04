@@ -1,10 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 
 use nonempty::NonEmpty;
 use once_cell::sync::Lazy;
+use pepper_sync::error::SyncRecoveryObservables;
 use pepper_sync::wallet::SyncMode;
 use zcash_address::{ToAddress, ZcashAddress};
 use zcash_client_backend::data_api::error::Error as ZcbError;
@@ -15,15 +17,19 @@ use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::consensus::NetworkType;
 use zcash_protocol::memo::MemoBytes;
 use zcash_protocol::value::Zatoshis;
+use zcash_protocol::TxId;
 use zingo_status::confirmation_status::ConfirmationStatus;
 use zingolib::config::{ChainType, ClientConfig, WalletConfig, construct_indexer_uri};
-use zingolib::data::proposal::total_fee;
+use zingolib::data::proposal::{total_fee, ProportionalFeeProposal};
+use zingolib::wallet::migration::ImmediateMigrationPlan;
 use zingolib::data::receivers::{transaction_request_from_receivers, Receiver};
 use zingolib::ensure_default_crypto_provider;
 use zingolib::lightclient::LightClient;
 use zingolib::wallet::error::ProposeSendError;
 use zingolib::wallet::keys::unified::{ReceiverSelection, UnifiedKeyStore};
-use zingolib::wallet::summary::data::{SendType, TransactionKind};
+use zingolib::wallet::summary::data::{
+    OutgoingNoteSummary, SendType, TransactionKind, TransactionSummary,
+};
 use zingolib::wallet::{
     PerformanceLevel, SyncConfig, TransparentAddressDiscovery, WalletSettings,
 };
@@ -34,10 +40,42 @@ pub type WalletResult<T> = Result<T, String>;
 pub struct ClientSlot {
     pub client: LightClient,
     pub mnemonic: String,
+    /// Quotes handed out by the propose calls, newest last, each under its
+    /// own token. A quote stores nothing in the wallet and does not pause
+    /// sync; signing re-proposes and checks the result against it.
+    pub quotes: VecDeque<(String, Quote)>,
+    /// Transactions signed by `create_transfer` and not yet broadcast, one
+    /// entry per signing, in the order they must reach the network. A ZIP-320
+    /// payment to a TEX address signs two: a shielded spend to an ephemeral
+    /// transparent address, then the payment from it. `create_transfer`
+    /// reports the last txid, and `broadcast_transfer` sends the whole entry.
+    pub signed: VecDeque<NonEmpty<TxId>>,
 }
 
+/// What a propose call showed the user, kept so signing can refuse a
+/// transaction that no longer matches it.
+pub enum Quote {
+    Send {
+        request: TransactionRequest,
+        proposal: ProportionalFeeProposal,
+        /// Whether the proposal makes Sapling proofs, which need the Sapling
+        /// parameters on disk before it is signed.
+        proves_sapling: bool,
+    },
+    Ironwood {
+        plan: ImmediateMigrationPlan,
+    },
+}
+
+/// Enough for every quote a send screen can have open at once; older quotes
+/// fall off and fail as unknown tokens.
+const MAX_QUOTES: usize = 32;
+static QUOTE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 static DOCUMENT_DIR: Lazy<Mutex<Option<PathBuf>>> = Lazy::new(|| Mutex::new(None));
-static CLIENTS: Lazy<tokio::sync::Mutex<HashMap<String, ClientSlot>>> =
+/// Each wallet has its own lock, so one wallet's network calls and proving
+/// do not hold up the others. The map lock is held only to look a slot up.
+static CLIENTS: Lazy<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<ClientSlot>>>>> =
     Lazy::new(|| tokio::sync::Mutex::new(HashMap::new()));
 
 const IRONWOOD_MAINNET: u32 = 3_428_143;
@@ -81,6 +119,23 @@ pub struct Poll {
     pub transactions: Vec<Transaction>,
 }
 
+async fn client_slot(alias: &str) -> WalletResult<Arc<tokio::sync::Mutex<ClientSlot>>> {
+    CLIENTS
+        .lock()
+        .await
+        .get(alias)
+        .cloned()
+        .ok_or_else(|| format!("wallet {alias} does not exist"))
+}
+
+/// Stops a slot taken out of the map, once any call still using it returns.
+async fn shut_down(slot: Arc<tokio::sync::Mutex<ClientSlot>>) {
+    let mut slot = slot.lock().await;
+    let _ = slot.client.stop_sync();
+    slot.client.go_offline().await;
+    let _ = slot.client.shutdown_save_task().await;
+}
+
 fn chain_from_network(network: &str) -> WalletResult<ChainType> {
     ChainType::try_from(network).map_err(|e| e.to_string())
 }
@@ -99,6 +154,8 @@ fn wallet_settings() -> WalletSettings {
         sync_config: SyncConfig {
             transparent_address_discovery: TransparentAddressDiscovery::default(),
             performance_level: PerformanceLevel::High,
+            // The wallet keeps following the chain after it catches up.
+            shutdown_on_completion: false,
         },
         min_confirmations: NonZeroU32::new(3).expect("3 is non-zero"),
     }
@@ -145,11 +202,18 @@ fn json_bool_field(value: &json::JsonValue, field: &str) -> bool {
 pub fn set_document_directory(path: String) -> WalletResult<()> {
     std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
     let path = PathBuf::from(path);
-    // The Sapling proving parameters are cached beside the wallet data. The
-    // zingolib default sits under $HOME, which is not the writable, backed-up
-    // location on a phone -- the host picks that and hands it to us here.
-    zingolib::wallet::utils::set_sapling_params_directory(path.join("sapling-params"));
+    // The Sapling proving parameters are cached beside the wallet data, in
+    // the writable location the host picks.
+    crate::sapling_params::set_directory(path.join("sapling-params"))?;
     *DOCUMENT_DIR.lock().expect("document dir lock") = Some(path);
+    Ok(())
+}
+
+#[cfg(feature = "uniffi-backend")]
+pub fn set_legacy_directory(path: String) -> WalletResult<()> {
+    // The parameters adopted from the old SDK go into the cache this sets.
+    document_dir()?;
+    crate::legacy::set_directory(PathBuf::from(path));
     Ok(())
 }
 
@@ -164,17 +228,16 @@ static SAPLING_PARAMS_REQUESTED: std::sync::atomic::AtomicBool =
 /// The parameters are ~50MB and are needed only to spend Sapling notes, so
 /// they are fetched on the first receive rather than compiled in. Doing it
 /// here means the download runs while the user is still looking at an
-/// incoming transaction, long before they can ask to send it. The fetch is
-/// blocking and verifies against published hashes, so it goes to a blocking
-/// thread and its outcome is logged rather than surfaced: a failure here must
-/// not fail the poll, and the spend path retries.
+/// incoming transaction, long before they can ask to send it. Its outcome is
+/// logged rather than surfaced: a failure here must not fail the poll, and
+/// the spend path fetches again.
 fn request_sapling_params_once(has_sapling: bool) {
     use std::sync::atomic::Ordering;
     if !has_sapling || SAPLING_PARAMS_REQUESTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    tokio::task::spawn_blocking(|| {
-        match zingolib::wallet::utils::fetch_sapling_params() {
+    tokio::spawn(async {
+        match crate::sapling_params::fetch().await {
             Ok(()) => eprintln!("[zcash] sapling params ready"),
             Err(e) => {
                 // Allow a later poll to try again.
@@ -201,6 +264,11 @@ pub async fn initialize(
     std::fs::create_dir_all(&wallet_dir).map_err(|e| e.to_string())?;
     let wallet_path = wallet_dir.join("zingo-wallet.dat");
     let exists = wallet_path.exists();
+    if !exists {
+        // The first open since the move off the ECC SDK, or a new wallet.
+        let alias = alias.clone();
+        let _ = tokio::task::spawn_blocking(move || crate::legacy::retire_alias(&alias)).await;
+    }
 
     let wallet_config = if exists && !new_wallet {
         WalletConfig::Read
@@ -212,6 +280,13 @@ pub async fn initialize(
             wallet_settings: wallet_settings(),
         }
     };
+
+    // A client still open on this wallet would keep saving to the file the
+    // new one reads, so it is shut down first.
+    let previous = CLIENTS.lock().await.remove(&alias);
+    if let Some(previous) = previous {
+        shut_down(previous).await;
+    }
 
     let config = ClientConfig::builder()
         .set_wallet_dir(wallet_dir)
@@ -228,44 +303,35 @@ pub async fn initialize(
     client.save_task().await;
     client.sync().await.map_err(|e| e.to_string())?;
 
-    let mut clients = CLIENTS.lock().await;
-    if let Some(mut previous) = clients.remove(&alias) {
-        let _ = previous.client.stop_sync();
-        previous.client.go_offline().await;
-    }
-    clients.insert(
+    CLIENTS.lock().await.insert(
         alias,
-        ClientSlot {
+        Arc::new(tokio::sync::Mutex::new(ClientSlot {
             client,
             mnemonic: mnemonic_seed,
-        },
+            quotes: VecDeque::new(),
+            signed: VecDeque::new(),
+        })),
     );
     Ok(())
 }
 
 pub async fn stop(alias: String) -> WalletResult<String> {
-    let mut clients = CLIENTS.lock().await;
-    if let Some(mut slot) = clients.remove(&alias) {
-        let _ = slot.client.stop_sync();
-        slot.client.go_offline().await;
-        let _ = slot.client.shutdown_save_task().await;
+    let slot = CLIENTS.lock().await.remove(&alias);
+    if let Some(slot) = slot {
+        shut_down(slot).await;
     }
     Ok("OK".to_string())
 }
 
 pub async fn rescan(alias: String) -> WalletResult<()> {
-    let mut clients = CLIENTS.lock().await;
-    let slot = clients
-        .get_mut(&alias)
-        .ok_or_else(|| format!("wallet {alias} does not exist"))?;
+    let slot = client_slot(&alias).await?;
+    let mut slot = slot.lock().await;
     slot.client.rescan().await.map_err(|e| e.to_string())
 }
 
 pub async fn derive_unified_address(alias: String) -> WalletResult<Addresses> {
-    let mut clients = CLIENTS.lock().await;
-    let slot = clients
-        .get_mut(&alias)
-        .ok_or_else(|| format!("wallet {alias} does not exist"))?;
+    let slot = client_slot(&alias).await?;
+    let mut slot = slot.lock().await;
     let chain = slot.client.chain_type();
 
     let unified_json = slot.client.unified_addresses_json().await;
@@ -327,10 +393,8 @@ pub async fn derive_unified_address(alias: String) -> WalletResult<Addresses> {
 }
 
 pub async fn get_latest_network_height(alias: String) -> WalletResult<u32> {
-    let mut clients = CLIENTS.lock().await;
-    let slot = clients
-        .get_mut(&alias)
-        .ok_or_else(|| format!("wallet {alias} does not exist"))?;
+    let slot = client_slot(&alias).await?;
+    let mut slot = slot.lock().await;
     let info = slot.client.info().await.map_err(|e| e.to_string())?;
     Ok(u32::try_from(info.latest_block_height).unwrap_or(u32::MAX))
 }
@@ -357,8 +421,9 @@ pub async fn get_birthday_height(host: String, port: u32) -> WalletResult<u32> {
     Ok(u32::try_from(info.latest_block_height).unwrap_or(u32::MAX))
 }
 
-pub fn is_valid_address(address: String, _network: String) -> bool {
-    ZcashAddress::try_from_encoded(&address).is_ok()
+pub fn is_valid_address(address: String, network: String) -> bool {
+    chain_from_network(&network)
+        .is_ok_and(|chain| zcash_keys::address::Address::decode(&chain, &address).is_some())
 }
 
 pub fn derive_viewing_key(mnemonic_seed: String, network: String) -> WalletResult<String> {
@@ -367,7 +432,7 @@ pub fn derive_viewing_key(mnemonic_seed: String, network: String) -> WalletResul
     let keys = UnifiedKeyStore::new_from_mnemonic(chain, &mnemonic, AccountId::ZERO)
         .map_err(|e| e.to_string())?;
     let ufvk = UnifiedFullViewingKey::try_from(&keys).map_err(|e| e.to_string())?;
-    Ok(ufvk.encode(&chain))
+    ufvk.encode(&chain).map_err(|e| e.to_string())
 }
 
 pub fn ironwood_activation_height(network: String) -> Option<u32> {
@@ -379,30 +444,38 @@ pub fn ironwood_activation_height(network: String) -> Option<u32> {
 }
 
 pub async fn poll(alias: String) -> WalletResult<Poll> {
-    let mut clients = CLIENTS.lock().await;
-    let slot = clients
-        .get_mut(&alias)
-        .ok_or_else(|| format!("wallet {alias} does not exist"))?;
+    let slot = client_slot(&alias).await?;
+    let mut slot = slot.lock().await;
 
-    let status = match slot.client.sync_mode() {
-        SyncMode::Running | SyncMode::Paused => "SYNCING",
-        SyncMode::Shutdown => "STOPPED",
-        SyncMode::NotRunning => {
-            if slot
-                .client
-                .latest_sync_status()
-                .is_some_and(|sync| sync.is_complete())
-            {
-                "SYNCED"
-            } else {
-                "STOPPED"
-            }
+    // A failed session leaves the wallet behind until another one starts,
+    // and the client reports the failure only to a caller that polls for it.
+    if let Some((recovery, description)) = slot.client.poll_sync_recovery() {
+        if recovery != SyncRecoveryObservables::Abort {
+            slot.client.sync().await.map_err(|e| e.to_string())?;
         }
+        return Err(format!("sync failed: {description}"));
+    }
+
+    // A continuous sync session keeps running after it reaches the tip, so
+    // the session being alive does not mean the wallet is behind. The latest
+    // published status says whether every scan range is scanned.
+    let caught_up = slot
+        .client
+        .latest_sync_status()
+        .is_some_and(|sync| sync.is_complete());
+    let status = match slot.client.sync_mode() {
+        SyncMode::Shutdown => "STOPPED",
+        _ if caught_up => "SYNCED",
+        SyncMode::Running | SyncMode::Paused => "SYNCING",
+        SyncMode::NotRunning => "STOPPED",
     };
 
     let mut scan_progress = 0.0_f64;
     if let Some(sync) = slot.client.latest_sync_status() {
-        scan_progress = f64::from(sync.percentage_total_outputs_scanned);
+        if sync.total_outputs > 0 {
+            scan_progress =
+                sync.total_outputs_scanned as f64 * 100.0 / sync.total_outputs as f64;
+        }
         if status == "SYNCED" {
             scan_progress = 100.0;
         }
@@ -435,15 +508,16 @@ pub async fn poll(alias: String) -> WalletResult<Poll> {
             .is_some_and(|value| !value.is_zero()),
     );
 
+    // Stored data that cannot be summarized fails the same way on every poll,
+    // so it must not hold back the balances and status above.
     let mut transactions = Vec::new();
     if let Ok(summaries) = slot.client.transaction_summaries(false).await {
         for tx in summaries.iter() {
             let is_shielding = matches!(tx.kind, TransactionKind::Sent(SendType::Shield));
-            let to_address = tx
-                .outgoing_orchard_notes
-                .iter()
-                .chain(tx.outgoing_sapling_notes.iter())
-                .find_map(|note| note.recipient_unified_address.clone());
+            let to_address = match tx.kind {
+                TransactionKind::Sent(_) => sent_to_address(tx),
+                TransactionKind::Received => None,
+            };
             let mined_height = if let ConfirmationStatus::Confirmed(height) = tx.status {
                 u32::from(height) as i64
             } else {
@@ -459,7 +533,7 @@ pub async fn poll(alias: String) -> WalletResult<Poll> {
                 to_address,
                 is_shielding,
                 is_expired,
-                memos: Vec::new(),
+                memos: memos(tx),
             });
         }
     }
@@ -474,15 +548,113 @@ pub async fn poll(alias: String) -> WalletResult<Poll> {
     })
 }
 
-const STORED_PROPOSAL_PREFIX: &str = "stored:";
-const IRONWOOD_PROPOSAL_PREFIX: &str = "ironwood:";
-
-fn stored_token(alias: &str) -> String {
-    format!("{STORED_PROPOSAL_PREFIX}{alias}")
+/// The address a sent transaction paid. The outgoing notes and coins
+/// include the wallet's own change, so an output the wallet also received is
+/// skipped. A send to self has no other output and reports its own address.
+fn sent_to_address(tx: &TransactionSummary) -> Option<String> {
+    let shielded = [
+        (&tx.outgoing_ironwood_notes, &tx.ironwood_notes),
+        (&tx.outgoing_orchard_notes, &tx.orchard_notes),
+        (&tx.outgoing_sapling_notes, &tx.sapling_notes),
+    ];
+    let address = |note: &OutgoingNoteSummary| {
+        note.recipient_unified_address
+            .clone()
+            .unwrap_or_else(|| note.recipient.clone())
+    };
+    let external_note = shielded.iter().find_map(|(outgoing, owned)| {
+        outgoing
+            .iter()
+            .find(|note| !owned.iter().any(|own| own.output_index == note.output_index))
+            .map(address)
+    });
+    external_note
+        .or_else(|| {
+            tx.outgoing_transparent_coins
+                .iter()
+                .find(|coin| {
+                    !tx.transparent_coins
+                        .iter()
+                        .any(|own| own.output_index == coin.output_index)
+                })
+                .map(|coin| coin.recipient.clone())
+        })
+        .or_else(|| {
+            shielded
+                .iter()
+                .find_map(|(outgoing, _)| outgoing.first().map(address))
+        })
 }
 
-fn ironwood_token(alias: &str) -> String {
-    format!("{IRONWOOD_PROPOSAL_PREFIX}{alias}")
+/// The text memos on a transaction's outputs, each once. A note sent to self
+/// appears as both an outgoing and a received note.
+fn memos(tx: &TransactionSummary) -> Vec<String> {
+    let received = tx
+        .ironwood_notes
+        .iter()
+        .chain(&tx.orchard_notes)
+        .chain(&tx.sapling_notes)
+        .filter_map(|note| note.memo.as_ref());
+    let sent = tx
+        .outgoing_ironwood_notes
+        .iter()
+        .chain(&tx.outgoing_orchard_notes)
+        .chain(&tx.outgoing_sapling_notes)
+        .filter_map(|note| note.memo.as_ref());
+    let mut memos: Vec<String> = Vec::new();
+    for memo in sent.chain(received) {
+        if !memo.is_empty() && !memos.contains(memo) {
+            memos.push(memo.clone());
+        }
+    }
+    memos
+}
+
+const STALE_QUOTE: &str = "the wallet changed since this quote; propose again";
+
+/// Keeps a quote under a fresh token and returns the token.
+fn store_quote(slot: &mut ClientSlot, quote: Quote) -> String {
+    let token = format!("quote:{}", QUOTE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed));
+    if slot.quotes.len() >= MAX_QUOTES {
+        slot.quotes.pop_front();
+    }
+    slot.quotes.push_back((token.clone(), quote));
+    token
+}
+
+fn find_quote<'a>(slot: &'a ClientSlot, token: &str) -> WalletResult<&'a Quote> {
+    slot.quotes
+        .iter()
+        .find(|(t, _)| t == token)
+        .map(|(_, quote)| quote)
+        .ok_or_else(|| "unknown proposal token".to_string())
+}
+
+fn take_quote(slot: &mut ClientSlot, token: &str) -> WalletResult<Quote> {
+    let index = slot
+        .quotes
+        .iter()
+        .position(|(t, _)| t == token)
+        .ok_or_else(|| "unknown proposal token".to_string())?;
+    Ok(slot.quotes.remove(index).expect("index in range").1)
+}
+
+/// True when two proposals spend the same inputs into the same outputs for
+/// the same fee. Target and anchor heights are left out: they move with
+/// every block, and a new block alone does not change what the user agreed
+/// to.
+fn same_spend(a: &ProportionalFeeProposal, b: &ProportionalFeeProposal) -> bool {
+    a.proposed_version() == b.proposed_version()
+        && a.steps().len() == b.steps().len()
+        && a.steps().iter().zip(b.steps().iter()).all(|(x, y)| {
+            x.transaction_request() == y.transaction_request()
+                && x.payment_pools() == y.payment_pools()
+                && x.transparent_inputs() == y.transparent_inputs()
+                && x.shielded_inputs() == y.shielded_inputs()
+                && x.prior_step_inputs() == y.prior_step_inputs()
+                && x.balance() == y.balance()
+                && x.is_shielding() == y.is_shielding()
+        })
 }
 
 fn memo_bytes(memo: &str) -> WalletResult<MemoBytes> {
@@ -521,19 +693,29 @@ fn map_propose_send_error(err: ProposeSendError) -> String {
 }
 
 async fn propose_request(alias: String, request: TransactionRequest) -> WalletResult<String> {
-    let mut clients = CLIENTS.lock().await;
-    let slot = clients
-        .get_mut(&alias)
-        .ok_or_else(|| format!("wallet {alias} does not exist"))?;
+    let slot = client_slot(&alias).await?;
+    let mut slot = slot.lock().await;
+    // A preview neither stores the proposal nor pauses sync, so a quote the
+    // user abandons leaves the wallet syncing.
     let proposal = slot
         .client
-        .propose_send(request, AccountId::ZERO)
+        .preview_send(request.clone(), AccountId::ZERO)
         .await
         .map_err(map_propose_send_error)?;
     let fee = total_fee(&proposal).map_err(|e| e.to_string())?;
+    let transaction_count = proposal.steps().len();
+    let proves_sapling = zingolib::wallet::sapling_params::proves_sapling(&proposal);
+    let token = store_quote(
+        &mut slot,
+        Quote::Send {
+            request,
+            proposal,
+            proves_sapling,
+        },
+    );
     Ok(json::object! {
-        "proposalBase64" => stored_token(&alias),
-        "transactionCount" => proposal.steps().len(),
+        "proposalBase64" => token,
+        "transactionCount" => transaction_count,
         "totalFee" => fee.into_u64().to_string(),
     }
     .dump())
@@ -572,59 +754,97 @@ pub async fn create_transfer(
     proposal_base64: String,
     mnemonic_seed: String,
 ) -> WalletResult<String> {
-    let mut clients = CLIENTS.lock().await;
-    let slot = clients
-        .get_mut(&alias)
-        .ok_or_else(|| format!("wallet {alias} does not exist"))?;
+    let slot = client_slot(&alias).await?;
+    let proves_sapling = match find_quote(&*slot.lock().await, &proposal_base64)? {
+        Quote::Send { proves_sapling, .. } => *proves_sapling,
+        Quote::Ironwood { .. } => false,
+    };
+    // Fetched outside the lock: the download can take a while, and polls
+    // must keep answering meanwhile.
+    if proves_sapling {
+        crate::sapling_params::fetch().await?;
+    }
+
+    let mut slot = slot.lock().await;
     if slot.mnemonic != mnemonic_seed {
         return Err("mnemonic mismatch".to_string());
     }
 
-    if proposal_base64 == ironwood_token(&alias) {
-        let summary = slot
-            .client
-            .quick_immediate_migration(AccountId::ZERO, true)
-            .await
-            .map_err(|e| describe_error(&e))?;
-        let txid = summary
-            .txids
-            .first()
-            .map(|txid| txid.to_string())
-            .ok_or_else(|| "ironwood migration produced no transactions".to_string())?;
-        return Ok(spend_success_json(txid, String::new()));
+    match take_quote(&mut slot, &proposal_base64)? {
+        Quote::Ironwood { plan } => {
+            // Hold sync still across the re-plan and the migration, so the
+            // notes the migration spends are the ones checked here.
+            // quick_immediate_migration's own pause finds sync already
+            // paused and leaves the resume to this guard.
+            let _pause = slot.client.pause_sync_scoped().map_err(|e| e.to_string())?;
+            let fresh = slot
+                .client
+                .plan_immediate_migration(AccountId::ZERO)
+                .await
+                .map_err(|e| e.to_string())?;
+            if fresh != plan {
+                return Err(STALE_QUOTE.to_string());
+            }
+            let summary = slot
+                .client
+                .quick_immediate_migration(AccountId::ZERO, true)
+                .await
+                .map_err(|e| describe_error(&e))?;
+            let txid = summary
+                .txids
+                .first()
+                .map(|txid| txid.to_string())
+                .ok_or_else(|| "ironwood migration produced no transactions".to_string())?;
+            Ok(spend_success_json(txid, String::new()))
+        }
+        Quote::Send {
+            request, proposal, ..
+        } => {
+            // Storing the proposal pauses sync until it is calculated or
+            // cleared, so the wallet cannot shift between this check and
+            // the signing.
+            let fresh = slot
+                .client
+                .propose_send(request, AccountId::ZERO)
+                .await
+                .map_err(map_propose_send_error)?;
+            if !same_spend(&fresh, &proposal) {
+                slot.client.clear_proposal().await;
+                return Err(STALE_QUOTE.to_string());
+            }
+            let txids = slot
+                .client
+                .calculate_stored_proposal()
+                .await
+                .map_err(|e| describe_error(&e))?;
+            // The last transaction pays the recipient; any before it fund
+            // it (the ephemeral step of a TEX payment).
+            let txid = *txids.last();
+            if slot.signed.len() >= MAX_QUOTES {
+                slot.signed.pop_front();
+            }
+            slot.signed.push_back(txids);
+            let raw = {
+                let wallet = slot.client.wallet().read().await;
+                let transaction = wallet
+                    .wallet_transactions
+                    .get(&txid)
+                    .ok_or_else(|| format!("signed tx {txid} missing from wallet"))?;
+                let mut bytes = Vec::new();
+                transaction
+                    .transaction()
+                    .write(&mut bytes)
+                    .map_err(|e| e.to_string())?;
+                hex::encode(bytes)
+            };
+            Ok(spend_success_json(txid.to_string(), raw))
+        }
     }
-
-    if proposal_base64 != stored_token(&alias) {
-        return Err("unknown proposal token".to_string());
-    }
-
-    let txids = slot
-        .client
-        .calculate_stored_proposal()
-        .await
-        .map_err(|e| describe_error(&e))?;
-    let txid = *txids.first();
-    let raw = {
-        let wallet = slot.client.wallet().read().await;
-        let transaction = wallet
-            .wallet_transactions
-            .get(&txid)
-            .ok_or_else(|| format!("signed tx {txid} missing from wallet"))?;
-        let mut bytes = Vec::new();
-        transaction
-            .transaction()
-            .write(&mut bytes)
-            .map_err(|e| e.to_string())?;
-        hex::encode(bytes)
-    };
-    Ok(spend_success_json(txid.to_string(), raw))
 }
 
 pub async fn broadcast_transfer(alias: String, txid: String) -> WalletResult<String> {
-    let mut clients = CLIENTS.lock().await;
-    let slot = clients
-        .get_mut(&alias)
-        .ok_or_else(|| format!("wallet {alias} does not exist"))?;
+    let slot = client_slot(&alias).await?;
+    let mut slot = slot.lock().await;
     let parsed = {
         let wallet = slot.client.wallet().read().await;
         wallet
@@ -634,13 +854,18 @@ pub async fn broadcast_transfer(alias: String, txid: String) -> WalletResult<Str
             .copied()
             .ok_or_else(|| format!("unknown txid {txid}"))?
     };
-    let txids = NonEmpty::from_vec(vec![parsed]).expect("one txid");
+    // Every transaction from the signing that produced this txid goes out,
+    // in order, so a TEX payment's ephemeral step is followed by the payment.
+    let txids = match slot.signed.iter().position(|ids| *ids.last() == parsed) {
+        Some(index) => slot.signed.remove(index).expect("index in range"),
+        None => NonEmpty::new(parsed),
+    };
     let sent = slot
         .client
         .transmit_calculated(txids)
         .await
         .map_err(|e| describe_error(&e))?;
-    Ok(sent.first().to_string())
+    Ok(sent.last().to_string())
 }
 
 pub async fn shield_funds(
@@ -652,10 +877,8 @@ pub async fn shield_funds(
     let threshold_zats: u64 = threshold
         .parse()
         .map_err(|_| format!("invalid shield threshold {threshold}"))?;
-    let mut clients = CLIENTS.lock().await;
-    let slot = clients
-        .get_mut(&alias)
-        .ok_or_else(|| format!("wallet {alias} does not exist"))?;
+    let slot = client_slot(&alias).await?;
+    let mut slot = slot.lock().await;
     if slot.mnemonic != seed {
         return Err("mnemonic mismatch".to_string());
     }
@@ -686,10 +909,8 @@ pub async fn shield_funds(
 }
 
 pub async fn propose_orchard_to_ironwood_migration(alias: String) -> WalletResult<String> {
-    let mut clients = CLIENTS.lock().await;
-    let slot = clients
-        .get_mut(&alias)
-        .ok_or_else(|| format!("wallet {alias} does not exist"))?;
+    let slot = client_slot(&alias).await?;
+    let mut slot = slot.lock().await;
     let plan = slot
         .client
         .plan_immediate_migration(AccountId::ZERO)
@@ -698,10 +919,13 @@ pub async fn propose_orchard_to_ironwood_migration(alias: String) -> WalletResul
     if plan.is_empty() {
         return Err("no spendable Orchard notes to migrate".to_string());
     }
+    let amount = plan.migrated.to_string();
+    let fee = plan.fee.to_string();
+    let token = store_quote(&mut slot, Quote::Ironwood { plan });
     Ok(json::object! {
-        "amountZatoshi" => plan.migrated.to_string(),
-        "feeZatoshi" => plan.fee.to_string(),
-        "proposalBase64" => ironwood_token(&alias),
+        "amountZatoshi" => amount,
+        "feeZatoshi" => fee,
+        "proposalBase64" => token,
     }
     .dump())
 }

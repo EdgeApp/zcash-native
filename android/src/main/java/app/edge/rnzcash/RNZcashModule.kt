@@ -32,6 +32,13 @@ class RNZcashModule(
             val dir = File(reactContext.filesDir, "native/zcash")
             dir.mkdirs()
             uniffi.zcash.setDocumentDirectory(dir.absolutePath)
+            // The ECC SDK kept its files here. Retiring them is best effort
+            // and never blocks the wallet.
+            runCatching {
+                uniffi.zcash.setLegacyDirectory(
+                    File(reactContext.noBackupFilesDir, "co.electricoin.zcash").absolutePath
+                )
+            }
             documentDirReady = true
         }
     }

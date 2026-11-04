@@ -16,6 +16,9 @@ class RNZcash: RCTEventEmitter {
       for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
     let path = root.appendingPathComponent("native/zcash", isDirectory: true).path
     try EdgeZcashClient.rustSetDocumentDirectory(path: path)
+    // The ECC SDK kept its files at the Documents root. Retiring them is
+    // best effort and never blocks the wallet.
+    try? EdgeZcashClient.rustSetLegacyDirectory(path: root.path)
     RNZcash.didSetDocumentDirectory = true
   }
 

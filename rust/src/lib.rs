@@ -1,3 +1,5 @@
+mod legacy;
+mod sapling_params;
 mod wallet;
 
 #[cfg(feature = "napi-backend")]

@@ -46,6 +46,9 @@ namespace zcash {
   void set_document_directory(string path);
 
   [Throws=ZcashError]
+  void set_legacy_directory(string path);
+
+  [Throws=ZcashError]
   void initialize(
     string mnemonic_seed,
     u32 birthday_height,
