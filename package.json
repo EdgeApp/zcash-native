@@ -1,6 +1,6 @@
 {
   "name": "zcash-native",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Native Zcash wallet library for React Native and Node.js (zingolib)",
   "homepage": "https://github.com/EdgeApp/zcash-native",
   "repository": {
