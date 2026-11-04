@@ -1,3 +1,4 @@
+mod legacy;
 mod sapling_params;
 mod wallet;
 

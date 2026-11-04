@@ -7,6 +7,7 @@
 - changed: The Sapling proving parameters (~50MB) are no longer compiled into the native library. They download from download.z.cash into `<documentDirectory>/sapling-params` the first time a wallet sees a Sapling balance, and again on demand if a Sapling spend finds them missing. Hashes are verified before the files are written.
 - changed: Move to the NU7-ready zingolib base (EdgeApp/zingolib@c8ceeb9)
 - changed: Build the Android library for armeabi-v7a as well as arm64-v8a
+- changed: Delete the old Zcash SDK wallet files and reuse their Sapling parameters instead of downloading them again
 - fixed: Send, shield and migration failures now report the whole error chain instead of zingolib's outermost label. A rejected broadcast used to surface only "Send error.", which named neither the server nor the reason; it now carries the indexer's own message, so a consensus rejection reads as the rejection it is.
 - fixed: Keep polling after a failed sync poll instead of freezing at the last balance
 - fixed: Report the recipient and memos of sent transactions

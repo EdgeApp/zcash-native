@@ -51,6 +51,39 @@ pub async fn fetch() -> Result<(), String> {
     Ok(())
 }
 
+/// Takes a parameter file another SDK downloaded, so the wallet does not
+/// fetch the same 50 MB again. The file is used only if it verifies and the
+/// cache does not already hold one. With `consume`, it is moved rather than
+/// copied, for a caller that would delete it afterwards anyway.
+///
+/// Blocks on the fetch lock, so it must run off the async runtime.
+pub fn adopt(file: SaplingParamFile, source: &Path, consume: bool) -> Result<bool, String> {
+    let _turn = FETCH_LOCK.blocking_lock();
+    let directory = DIRECTORY
+        .get()
+        .ok_or_else(|| "documentDirectory is not set".to_string())?;
+    let destination = directory.join(file.file_name());
+    // A cached file that fails verification is replaced by the next fetch.
+    if destination.exists() {
+        return Ok(false);
+    }
+    let bytes = match std::fs::read(source) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(false),
+    };
+    if file.verify(&bytes).is_err() {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+    if consume && std::fs::rename(source, &destination).is_ok() {
+        return Ok(true);
+    }
+    let partial = destination.with_extension("partial");
+    std::fs::write(&partial, &bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&partial, &destination).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 async fn is_cached(file: SaplingParamFile, path: &Path) -> bool {
     match tokio::fs::read(path).await {
         Ok(bytes) => file.verify(&bytes).is_ok(),

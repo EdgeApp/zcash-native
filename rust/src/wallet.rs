@@ -209,6 +209,14 @@ pub fn set_document_directory(path: String) -> WalletResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "uniffi-backend")]
+pub fn set_legacy_directory(path: String) -> WalletResult<()> {
+    // The parameters adopted from the old SDK go into the cache this sets.
+    document_dir()?;
+    crate::legacy::set_directory(PathBuf::from(path));
+    Ok(())
+}
+
 /// Set once the Sapling parameter download has been started, so a sync that
 /// keeps reporting a Sapling balance does not queue it again.
 static SAPLING_PARAMS_REQUESTED: std::sync::atomic::AtomicBool =
@@ -256,6 +264,11 @@ pub async fn initialize(
     std::fs::create_dir_all(&wallet_dir).map_err(|e| e.to_string())?;
     let wallet_path = wallet_dir.join("zingo-wallet.dat");
     let exists = wallet_path.exists();
+    if !exists {
+        // The first open since the move off the ECC SDK, or a new wallet.
+        let alias = alias.clone();
+        let _ = tokio::task::spawn_blocking(move || crate::legacy::retire_alias(&alias)).await;
+    }
 
     let wallet_config = if exists && !new_wallet {
         WalletConfig::Read

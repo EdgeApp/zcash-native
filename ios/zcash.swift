@@ -1231,6 +1231,12 @@ public func setDocumentDirectory(path: String)throws   {try rustCallWithError(Ff
     )
 }
 }
+public func setLegacyDirectory(path: String)throws   {try rustCallWithError(FfiConverterTypeZcashError_lift) {
+    uniffi_zcash_fn_func_set_legacy_directory(
+        FfiConverterString.lower(path),$0
+    )
+}
+}
 public func shieldFunds(alias: String, seed: String, memo: String, threshold: String)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeZcashError_lift) {
     uniffi_zcash_fn_func_shield_funds(
@@ -1310,6 +1316,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zcash_checksum_func_set_document_directory() != 27339) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zcash_checksum_func_set_legacy_directory() != 61026) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zcash_checksum_func_shield_funds() != 4791) {
