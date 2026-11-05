@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.1.1 (2026-11-04)
+
+- fixed: Include the Android, iOS and Node native libraries in the published package
+
 ## 0.1.0 (2026-11-04)
 
 - added: Node N-API addon (`zcash-native/node`) over zingolib `LightClient`, with one wallet file per alias under `documentDirectory`. Tools and Synchronizer keep the existing JS contract so Edge engines do not change. First open after this upgrade creates a new `.dat` and syncs from birthday.
